@@ -18,5 +18,5 @@ m3u8_obj = m3u8.loads(m3u8_response.text)
 with open(args.filename, 'wb') as f:
 	for segment in m3u8_obj.segments:
 		print('Segment', segment.uri)
-		seg_response = requests.get(base_uri + segment.uri, verify=False)
+		seg_response = requests.get(('' if segment.uri[:4]=='http' else base_uri)  + segment.uri, verify=False)
 		f.write(seg_response.content)
