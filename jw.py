@@ -11,8 +11,9 @@ log = logging.getLogger(__name__)
 def parse_arguments(arguments_list=None):
 	parser = argparse.ArgumentParser()
 	parser.add_argument('--verbose', '-v', action='count', default=0)
-	parser.add_argument('url', help='m3u8 file URL')
-	parser.add_argument('filename', help='target file')
+	parser.add_argument('url', 
+		help='ERR series link for web scraping; m3u8 file URL fir single download; links cachefile for series download')
+	parser.add_argument('filename', help='target file', nargs='?', default=None)
 	return parser.parse_args(arguments_list)
 
 async def main(args):
@@ -26,12 +27,20 @@ async def main(args):
 	ctx.verify_mode = ssl.CERT_NONE
 
 	if args.url[args.url.rfind(".")+1:] == 'm3u8':
-		segmentfiles = _fetch_segments(args.url, '{}.tempdir'.format(args.filename))
-		if segmentfiles:
-			_assemble_segments(segmentfiles, args.filename)
+		_fetch_single_episode(args.url, args.filename)
+	elif args.url.rfind('-linkscache.txt') > 0:
+		with open(args.url, 'r') as cf:
+			_download_cached_links(cf)
 	else:
 		with open('{}-linkscache.txt'.format(args.filename), 'w') as cf:
 			await _scrape_links_from(args.url, args.filename, cf)
+
+########
+
+def _fetch_single_episode(url, filename):
+	segmentfiles = _fetch_segments(url, '{}.tempdir'.format(filename))
+	if segmentfiles:
+		_assemble_segments(segmentfiles, filename)
 
 def _fetch_segments(url, tempdirname):
 	if os.path.isdir(tempdirname):
@@ -79,6 +88,8 @@ def _assemble_segments(segmentfiles, target_filename):
 	print('')
 	log.info('Downloaded to {}'.format(target_filename))
 
+########
+
 async def _scrape_links_from(url, target_filename, links_cachefile):
 	seasons_el = None
 	episodes_el = None		# 2-dim array: [season][episode]
@@ -99,6 +110,10 @@ async def _scrape_links_from(url, target_filename, links_cachefile):
 	m3u8urls = []
 	page.on('request', lambda request: asyncio.ensure_future(_intercept_request(request, m3u8urls)))
 
+	# prep metadata dir
+	metadata_dirname = '{}.meta'.format(target_filename)
+	os.mkdir(metadata_dirname)
+
 	# launch
 	log.debug('opening {}'.format(url))
 	await page.goto(url)
@@ -110,9 +125,13 @@ async def _scrape_links_from(url, target_filename, links_cachefile):
 			'#content-bg > div > app-menu > mat-sidenav-container > mat-sidenav-content > app-content > div > div > div.content-container.ng-star-inserted.not-scrolling > div > div.main-content-lead > p:nth-child(2)',
 			{'visible': True}
 		)'''
-		await page.screenshot({'path': '{}.png'.format(episode_filename)})
 
-		await _store_description(page, episode_filename)
+		# storing some meta
+		await page.screenshot({'path': os.path.join(metadata_dirname, '{}.png'.format(episode_filename))})
+		description = await _fetch_description(page)
+		with open(os.path.join(metadata_dirname, '{}.txt'.format(episode_filename)), 'w') as df:
+			df.write(description)
+
 		seasons_el = await page.JJ('mat-expansion-panel mat-panel-title')
 		episodes_el = await page.JJ('mat-list-item')
 		log.debug('elements detected: {} seasons, {} episodes'.format(len(seasons_el), len(episodes_el)))
@@ -167,16 +186,28 @@ def _select_maxres_m3u8(m3u8_obj):
 	else:
 		return m3u8_obj.uri
 
-async def _store_description(page, episode_filename):
+async def _fetch_description(page):
 	#content-bg > div > app-menu > mat-sidenav-container > mat-sidenav-content > app-content > div > div > div.content-container.ng-star-inserted.not-scrolling > div > div.main-content-lead > p:nth-child(2)
 	desc_el = await page.JJ('div.main-content-lead > p:nth-child(2)')
 	if desc_el:
 		desc_prop = await desc_el[0].getProperty('textContent')
 		desc = await desc_prop.jsonValue()
-		with open('{}.txt'.format(episode_filename), 'w') as df:
-			df.write(desc)
+		return desc
 	else:
 		log.warning('Description element not found')
+		return None
+
+########
+
+def _download_cached_links(links_cachefile):
+	for ln in map(lambda s: s.strip().partition(' '), links_cachefile):
+		log.debug(ln)
+		if os.path.isfile(ln[2]):
+			log.debug('file downloaded already {}'.format(ln[2]))
+		else:
+			_fetch_single_episode(ln[0], ln[2])
+
+########
 
 if __name__ == '__main__':
 	asyncio.get_event_loop().run_until_complete(main(parse_arguments()))
