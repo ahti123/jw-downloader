@@ -3,6 +3,8 @@
 import argparse, logging, os
 import m3u8, requests, ssl, urllib3
 from time import sleep
+import asyncio
+from pyppeteer import launch
 
 log = logging.getLogger(__name__)
 
@@ -13,7 +15,7 @@ def parse_arguments(arguments_list=None):
 	parser.add_argument('filename', help='target file')
 	return parser.parse_args(arguments_list)
 
-def main(args):
+async def main(args):
 	log.addHandler(logging.StreamHandler())
 	log.setLevel(logging.DEBUG if args.verbose>0 else logging.INFO)
 	log.info(args)
@@ -23,9 +25,13 @@ def main(args):
 	ctx.check_hostname = False
 	ctx.verify_mode = ssl.CERT_NONE
 
-	segmentfiles = _fetch_segments(args.url, '{}.tempdir'.format(args.filename))
-	if segmentfiles:
-		_assemble_segments(segmentfiles, args.filename)
+	if args.url[args.url.rfind(".")+1:] == 'm3u8':
+		segmentfiles = _fetch_segments(args.url, '{}.tempdir'.format(args.filename))
+		if segmentfiles:
+			_assemble_segments(segmentfiles, args.filename)
+	else:
+		with open('{}-linkscache.txt'.format(args.filename), 'w') as cf:
+			await _scrape_links_from(args.url, args.filename, cf)
 
 def _fetch_segments(url, tempdirname):
 	if os.path.isdir(tempdirname):
@@ -73,5 +79,104 @@ def _assemble_segments(segmentfiles, target_filename):
 	print('')
 	log.info('Downloaded to {}'.format(target_filename))
 
+async def _scrape_links_from(url, target_filename, links_cachefile):
+	seasons_el = None
+	episodes_el = None		# 2-dim array: [season][episode]
+	season_index = 0
+	episode_index = 0
+
+	# browser setup
+	browser = await launch()
+	page = await browser.newPage()
+	await page.setViewport({
+			'width': 1920,
+			'height': 1080,
+			'deviceScaleFactor': 1,
+		})
+
+	# setup m3u8 interception
+	await page.setRequestInterception(True)
+	m3u8urls = []
+	page.on('request', lambda request: asyncio.ensure_future(_intercept_request(request, m3u8urls)))
+
+	# launch
+	log.debug('opening {}'.format(url))
+	await page.goto(url)
+
+	while True:
+		episode_filename = '{}-S{:02d}E{:02d}'.format(target_filename, season_index+1, episode_index+1)
+		log.info(episode_filename)
+		'''await page.waitForSelector(
+			'#content-bg > div > app-menu > mat-sidenav-container > mat-sidenav-content > app-content > div > div > div.content-container.ng-star-inserted.not-scrolling > div > div.main-content-lead > p:nth-child(2)',
+			{'visible': True}
+		)'''
+		await page.screenshot({'path': '{}.png'.format(episode_filename)})
+
+		await _store_description(page, episode_filename)
+		seasons_el = await page.JJ('mat-expansion-panel mat-panel-title')
+		episodes_el = await page.JJ('mat-list-item')
+		log.debug('elements detected: {} seasons, {} episodes'.format(len(seasons_el), len(episodes_el)))
+
+		# videostream
+		if m3u8urls:
+			m3u8_response = requests.get(m3u8urls[0], verify=False)
+			m3u8_obj = m3u8.loads(m3u8_response.text)
+			maxres_url = _select_maxres_m3u8(m3u8_obj)
+			log.info(maxres_url)
+			links_cachefile.write('{} "{}.mp4"\r\n'.format(maxres_url, episode_filename))
+		else:
+			log.error('Error: no m3u8 master found!')
+		m3u8urls.clear()
+
+		# next episode
+		if episode_index+1 < len(episodes_el):
+			episode_index += 1
+			log.debug('moving to episode {}'.format(episode_index+1))
+			await episodes_el[episode_index].click()
+			# sleep(5)
+		elif season_index+1 < len(seasons_el):
+			season_index += 1
+			episode_index = 0
+			log.debug('moving to season {}'.format(season_index+1))
+			await seasons_el[season_index].click()
+		else:
+			log.debug('{} seasons walked'.format(season_index+1))
+			break
+
+	# await page.screenshot({'path': 'example.png'})
+	await browser.close()
+
+async def _intercept_request(request, m3u8urls):
+	# log.debug('_intercept_request {}'.format(request.url))
+	if request.url[request.url.rfind(".")+1:] == 'vtt':
+		log.info('subtitles found {}'.format(request.url))
+	elif request.url[request.url.rfind(".")+1:] == 'm3u8':
+		log.info('stream master found {}'.format(request.url))
+		m3u8urls.append(request.url)
+	await request.continue_()
+
+def _select_maxres_m3u8(m3u8_obj):
+	if m3u8_obj.is_variant:
+		max_stream = None
+		max_res = (0, 0)
+		for v in m3u8_obj.playlists:
+			if v.stream_info.resolution > max_res:
+				max_res = v.stream_info.resolution
+				max_stream = v.uri
+		return max_stream
+	else:
+		return m3u8_obj.uri
+
+async def _store_description(page, episode_filename):
+	#content-bg > div > app-menu > mat-sidenav-container > mat-sidenav-content > app-content > div > div > div.content-container.ng-star-inserted.not-scrolling > div > div.main-content-lead > p:nth-child(2)
+	desc_el = await page.JJ('div.main-content-lead > p:nth-child(2)')
+	if desc_el:
+		desc_prop = await desc_el[0].getProperty('textContent')
+		desc = await desc_prop.jsonValue()
+		with open('{}.txt'.format(episode_filename), 'w') as df:
+			df.write(desc)
+	else:
+		log.warning('Description element not found')
+
 if __name__ == '__main__':
-	main(parse_arguments())
+	asyncio.get_event_loop().run_until_complete(main(parse_arguments()))
