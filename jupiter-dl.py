@@ -1,7 +1,9 @@
 #!python3
 
 import argparse, logging, os
-import m3u8, requests, ssl, urllib3
+import m3u8, ssl
+from requests import get
+from urllib3 import disable_warnings
 from time import sleep
 import asyncio
 from pyppeteer import launch
@@ -21,7 +23,7 @@ async def main(args):
 	log.setLevel(logging.DEBUG if args.verbose>0 else logging.INFO)
 	log.info(args)
 
-	urllib3.disable_warnings()
+	disable_warnings()
 	ctx = ssl.create_default_context()
 	ctx.check_hostname = False
 	ctx.verify_mode = ssl.CERT_NONE
@@ -52,7 +54,7 @@ def _fetch_segments(url, tempdirname):
 	segmentfiles = []
 
 	base_uri = url[:url.rfind("/")+1]
-	m3u8_response = requests.get(url, verify=False)
+	m3u8_response = get(url, verify=False)
 	m3u8_obj = m3u8.loads(m3u8_response.text)
 	for segment in m3u8_obj.segments:
 		segmentfilename = '{}/{}'.format(tempdirname, segment.uri[segment.uri.rfind('/')+1:])
@@ -64,7 +66,7 @@ def _fetch_segments(url, tempdirname):
 		retries = 3
 		while retries:
 			try:
-				seg_response = requests.get(('' if segment.uri[:4]=='http' else base_uri)  + segment.uri, verify=False)
+				seg_response = get(('' if segment.uri[:4]=='http' else base_uri)  + segment.uri, verify=False)
 				with open(segmentfilename, 'wb') as sf:
 					sf.write(seg_response.content)
 				break
@@ -138,7 +140,7 @@ async def _scrape_links_from(url, target_filename, links_cachefile):
 
 		# videostream
 		if m3u8urls:
-			m3u8_response = requests.get(m3u8urls[0], verify=False)
+			m3u8_response = get(m3u8urls[0], verify=False)
 			m3u8_obj = m3u8.loads(m3u8_response.text)
 			maxres_url = _select_maxres_m3u8(m3u8_obj)
 			log.info(maxres_url)
