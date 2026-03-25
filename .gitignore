@@ -1,2 +1,10 @@
 *.meta
 *-linkscache.txt
+*.tempdir/
+*.mp4
+*.m4v
+*.vtt
+debug_page.html
+venv/
+.vscode/
+__pycache__/

@@ -1,6 +1,6 @@
 #!python3
 
-import argparse, logging, os
+import argparse, logging, os, subprocess
 import m3u8, ssl
 from requests import get
 from urllib3 import disable_warnings
@@ -40,9 +40,41 @@ async def main(args):
 ########
 
 def _fetch_single_episode(url, filename):
-	segmentfiles = _fetch_segments(url, '{}.tempdir'.format(filename))
-	if segmentfiles:
-		_assemble_segments(segmentfiles, filename)
+	m3u8_response = get(url, verify=False)
+	m3u8_obj = m3u8.loads(m3u8_response.text)
+	if m3u8_obj.is_variant:
+		video_url = _select_maxres_m3u8(m3u8_obj)
+		audio_url = _select_default_audio(m3u8_obj)
+		subtitle_tracks = _select_subtitles(m3u8_obj)
+		log.info('Selected video: {}'.format(video_url))
+
+		video_file = '{}.video'.format(filename)
+		segmentfiles = _fetch_segments(video_url, '{}.tempdir'.format(video_file))
+		if segmentfiles:
+			_assemble_segments(segmentfiles, video_file)
+
+		audio_file = None
+		if audio_url:
+			log.info('Selected audio: {}'.format(audio_url))
+			audio_file = '{}.audio'.format(filename)
+			segmentfiles = _fetch_segments(audio_url, '{}.tempdir'.format(audio_file))
+			if segmentfiles:
+				_assemble_segments(segmentfiles, audio_file)
+
+		sub_files = []
+		for sub in subtitle_tracks:
+			log.info('Subtitle: {} ({})'.format(sub['name'], sub['language']))
+			sub_file = '{}.sub.{}.vtt'.format(filename, sub['language'])
+			segmentfiles = _fetch_segments(sub['uri'], '{}.tempdir'.format(sub_file))
+			if segmentfiles:
+				_assemble_vtt(segmentfiles, sub_file)
+			sub_files.append((sub_file, sub['language'], sub['name']))
+
+		_mux(video_file, audio_file, sub_files, filename)
+	else:
+		segmentfiles = _fetch_segments(url, '{}.tempdir'.format(filename))
+		if segmentfiles:
+			_assemble_segments(segmentfiles, filename)
 
 def _fetch_segments(url, tempdirname):
 	if os.path.isdir(tempdirname):
@@ -56,6 +88,19 @@ def _fetch_segments(url, tempdirname):
 	base_uri = url[:url.rfind("/")+1]
 	m3u8_response = get(url, verify=False)
 	m3u8_obj = m3u8.loads(m3u8_response.text)
+	log.debug(m3u8_response.text)
+
+	# handle fMP4 init segment if present
+	if m3u8_obj.segment_map:
+		init_uri = m3u8_obj.segment_map[0].uri
+		init_filename = '{}/{}'.format(tempdirname, init_uri[init_uri.rfind('/')+1:])
+		segmentfiles.append(init_filename)
+		if not os.path.isfile(init_filename):
+			log.info('init segment: {}'.format(init_uri))
+			init_response = get(('' if init_uri[:4]=='http' else base_uri) + init_uri, verify=False)
+			with open(init_filename, 'wb') as sf:
+				sf.write(init_response.content)
+
 	for segment in m3u8_obj.segments:
 		segmentfilename = '{}/{}'.format(tempdirname, segment.uri[segment.uri.rfind('/')+1:])
 		segmentfiles.append(segmentfilename)
@@ -114,11 +159,18 @@ async def _scrape_links_from(url, target_filename, links_cachefile):
 
 	# prep metadata dir
 	metadata_dirname = '{}.meta'.format(target_filename)
-	os.mkdir(metadata_dirname)
+	os.makedirs(metadata_dirname, exist_ok=True)
 
 	# launch
 	log.debug('opening {}'.format(url))
 	await page.goto(url)
+	await asyncio.sleep(5)  # wait for SPA to render
+
+	# DEBUG: dump page HTML for inspection
+	page_html = await page.content()
+	with open('debug_page.html', 'w') as f:
+		f.write(page_html)
+	log.info('Page HTML dumped to debug_page.html')
 
 	while True:
 		episode_filename = '{}-S{:02d}E{:02d}'.format(target_filename, season_index+1, episode_index+1)
@@ -131,8 +183,11 @@ async def _scrape_links_from(url, target_filename, links_cachefile):
 		# storing some meta
 		await page.screenshot({'path': os.path.join(metadata_dirname, '{}.png'.format(episode_filename))})
 		description = await _fetch_description(page)
-		with open(os.path.join(metadata_dirname, '{}.txt'.format(episode_filename)), 'w') as df:
-			df.write(description)
+		if description:
+			with open(os.path.join(metadata_dirname, '{}.txt'.format(episode_filename)), 'w') as df:
+				df.write(description)
+		else:
+			log.warning('No description to save for {}'.format(episode_filename))
 
 		seasons_el = await page.JJ('mat-expansion-panel mat-panel-title')
 		episodes_el = await page.JJ('mat-list-item')
@@ -187,6 +242,76 @@ def _select_maxres_m3u8(m3u8_obj):
 		return max_stream
 	else:
 		return m3u8_obj.uri
+
+def _select_default_audio(m3u8_obj):
+	for media in m3u8_obj.media:
+		if media.type == 'AUDIO' and media.default == 'YES':
+			return media.uri
+	# fallback to first audio track
+	for media in m3u8_obj.media:
+		if media.type == 'AUDIO' and media.uri:
+			return media.uri
+	return None
+
+def _select_subtitles(m3u8_obj):
+	subs = []
+	for media in m3u8_obj.media:
+		if media.type == 'SUBTITLES' and media.uri:
+			subs.append({'uri': media.uri, 'language': media.language or 'und', 'name': media.name or ''})
+	return subs
+
+def _assemble_vtt(segmentfiles, target_filename):
+	log.info('Assembling {} VTT segments...'.format(len(segmentfiles)))
+	with open(target_filename, 'w') as f:
+		first = True
+		for sfname in segmentfiles:
+			with open(sfname, 'r') as sf:
+				content = sf.read()
+				if first:
+					f.write(content)
+					first = False
+				else:
+					# strip WEBVTT header and leading blank lines
+					lines = content.split('\n')
+					i = 0
+					for i, line in enumerate(lines):
+						if line.strip() and line.strip() != 'WEBVTT':
+							break
+					f.write('\n'.join(lines[i:]))
+			print('.', end='', flush=True)
+	print('')
+	log.info('Subtitles saved to {}'.format(target_filename))
+
+def _mux(video_file, audio_file, sub_files, output_file):
+	inputs = ['-i', video_file]
+	if audio_file:
+		inputs += ['-i', audio_file]
+	for sub_file, _, _ in sub_files:
+		inputs += ['-i', sub_file]
+
+	maps = ['-map', '0:v']
+	if audio_file:
+		maps += ['-map', '1:a']
+	sub_offset = 2 if audio_file else 1
+	metadata = []
+	for idx, (_, lang, name) in enumerate(sub_files):
+		maps += ['-map', '{}:0'.format(sub_offset + idx)]
+		metadata += [
+			'-metadata:s:s:{}'.format(idx), 'language={}'.format(lang),
+			'-metadata:s:s:{}'.format(idx), 'title={}'.format(name),
+		]
+
+	cmd = ['ffmpeg', '-y'] + inputs + maps + ['-c:v', 'copy', '-c:a', 'copy', '-c:s', 'mov_text'] + metadata + [output_file]
+	log.info('Muxing -> {}'.format(output_file))
+	log.debug(' '.join(cmd))
+	subprocess.run(cmd, check=True)
+
+	os.remove(video_file)
+	if audio_file:
+		os.remove(audio_file)
+	for sub_file, _, _ in sub_files:
+		os.remove(sub_file)
+	log.info('Muxed to {}'.format(output_file))
 
 async def _fetch_description(page):
 	#content-bg > div > app-menu > mat-sidenav-container > mat-sidenav-content > app-content > div > div > div.content-container.ng-star-inserted.not-scrolling > div > div.main-content-lead > p:nth-child(2)
